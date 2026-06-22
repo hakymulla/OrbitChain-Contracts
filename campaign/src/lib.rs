@@ -211,7 +211,7 @@ impl CampaignContract {
         storage_increment_asset_raised(&env, &asset_address, amount);
         increment_donor_asset_donation(&env, &donor, &asset_address, amount);
 
-        let mut donor_record =
+        let _donor_record =
             get_donor(&env, &donor).unwrap_or(DonorRecord::new_for(donor.clone(), asset.clone()));
         // Update donor record
         let existing_donor = get_donor(&env, &donor);
@@ -398,7 +398,7 @@ impl CampaignContract {
         let campaign =
             get_campaign(&env).unwrap_or_else(|| panic_with_error(&env, Error::NotInitialized));
 
-        let mut donor_record =
+        let _donor_record =
             get_donor(&env, &donor).unwrap_or_else(|| panic_with_error(&env, Error::NoDonorRecord));
 
         let mut donor_record =
@@ -626,6 +626,7 @@ impl CampaignContract {
 /// Reads the creator address from campaign storage and calls `require_auth()`.
 /// Panics with `Error::Unauthorized` if the campaign is not initialized;
 /// Soroban's auth framework panics if the invoker is not the creator.
+#[allow(dead_code)]
 fn require_creator(env: &Env) {
     let campaign = get_campaign(env).unwrap_or_else(|| panic_with_error(env, Error::Unauthorized));
     campaign.creator.require_auth();
