@@ -3,6 +3,7 @@
 use soroban_sdk::{
     contracterror, contracttype, panic_with_error, Address, BytesN, Env, String, Vec,
 };
+use soroban_sdk::{contracterror, contracttype, Address, BytesN, Env, String, Vec};
 
 // ─── Error enum ───────────────────────────────────────────────────────────────
 
@@ -231,6 +232,12 @@ pub enum DataKey {
     /// Per-asset donation by a donor — keyed by (donor_address, asset_address).
     /// Tracks exact amount contributed in each asset for pro-rata refund calculation.
     DonorAssetDonation(Address, Address),
+    /// Total number of donation calls accepted by this campaign.
+    DonationCount,
+    /// Number of unique donor addresses that have contributed.
+    UniqueDonorCount,
+    /// Total number of milestone release calls completed.
+    ReleaseCount,
 
     // ── Temporary ───────────────────────────────────────────────────────────
     /// Transient campaign status flag used during state transitions.
@@ -449,6 +456,8 @@ impl DonorRecord {
     /// Apply a new donation to this record.  Returns an error string (for
     /// debug builds) rather than panicking so the call site can choose how
     /// to surface it.
+    /// Apply a new donation to this record. Panics with `Error::Overflow` if
+    /// `total_donated` or `donation_count` overflows.
     pub fn apply_donation(
         &mut self,
         env: &Env,
@@ -461,12 +470,14 @@ impl DonorRecord {
             .total_donated
             .checked_add(amount)
             .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+            .unwrap_or_else(|| env.panic_with_error(Error::Overflow));
         self.last_donation_time = time;
         self.last_donation_ledger = ledger;
         self.donation_count = self
             .donation_count
             .checked_add(1)
             .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+            .unwrap_or_else(|| env.panic_with_error(Error::Overflow));
         self.asset = asset;
     }
 }
@@ -479,6 +490,46 @@ impl DonorRecord {
 pub struct CampaignStatusResponse {
     pub status: CampaignStatus,
     pub days_remaining: i64,
+}
+
+/// Dashboard-ready analytics for the canonical single-campaign contract.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CampaignReport {
+    pub creator: Address,
+    pub goal_amount: i128,
+    pub raised_amount: i128,
+    pub remaining_amount: i128,
+    /// Funding progress in basis points: 10_000 == 100%.
+    pub progress_bps: u32,
+    pub end_time: u64,
+    pub status: CampaignStatus,
+    pub milestone_count: u32,
+    pub donor_count: u32,
+    pub donation_count: u64,
+    pub release_count: u64,
+}
+
+/// Export-friendly aggregate counters for this contract instance.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformSummary {
+    pub total_campaigns: u64,
+    pub active_campaigns: u64,
+    pub total_donations: u64,
+    pub total_releases: u64,
+    pub total_transactions: u64,
+}
+
+/// Compact dashboard metrics mirroring the legacy core analytics API.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DashboardMetrics {
+    pub total_campaigns: u64,
+    pub active_campaigns: u64,
+    pub total_donations: u64,
+    pub total_releases: u64,
+    pub total_transactions: u64,
 }
 
 /// Emitted by `initialize`.

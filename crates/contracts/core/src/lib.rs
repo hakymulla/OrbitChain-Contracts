@@ -1,13 +1,61 @@
 //! OrbitChain core smart contract — campaign lifecycle, donations,
 //! withdrawals, analytics, and dashboard reporting.
+//!
+//! Deprecated legacy/reference contract. `campaign/` (`orbitchain-campaign`)
+//! is the canonical implementation for new campaign work. This crate remains
+//! in the workspace only for historical compatibility and reference while any
+//! remaining behavior is gradually migrated into the canonical contract.
 
 #![no_std]
+// `Events::publish` and the bare `env.register_contract` test helper are
+// marked deprecated in soroban-sdk 26.x in favour of `#[contractevent]` and
+// `env.register`. Migrating every call site here is tracked as a follow-up
+// issue; suppressing the warning keeps CI clean without changing the
+// published event topics or test behaviour.
+#![allow(deprecated)]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Env, String,
+    Symbol, Vec,
 };
 
 /// Issue #103 – Stellar base fee in stroops (1 XLM = 10,000,000 stroops)
 const BASE_FEE: i128 = 100;
+
+// ── Error types ──────────────────────────────────────────────────────────────
+
+/// Typed error codes for the OrbitChain core contract.
+///
+/// Each variant has a stable `u32` discriminant — **never renumber**.
+/// Callers can match on these codes programmatically instead of parsing
+/// opaque string messages out of `HostError` panics.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CoreError {
+    /// The requested campaign does not exist in storage.
+    CampaignNotFound = 1,
+    /// The campaign is not currently active (donations/withdrawals blocked).
+    CampaignNotActive = 2,
+    /// The supplied amount does not exceed the required base fee.
+    InsufficientAmount = 3,
+    /// The campaign does not have enough raised funds for the requested amount.
+    InsufficientFunds = 4,
+    /// The caller is not authorised to perform this operation.
+    Unauthorized = 5,
+    /// The asset symbol must be non-empty.
+    AssetNotSpecified = 6,
+    /// The contract has not been initialised (no admin set).
+    NotInitialized = 7,
+    /// No pending withdrawal request exists for this campaign.
+    NoPendingWithdrawal = 8,
+    /// A withdrawal request is already pending or approved for this campaign.
+    WithdrawalAlreadyPending = 9,
+    /// The withdrawal request is not in the `Pending` state.
+    WithdrawalNotPending = 10,
+    /// The withdrawal request must be `Approved` before it can be submitted.
+    WithdrawalNotApproved = 11,
+    /// The withdrawal amount must be greater than zero.
+    InvalidWithdrawalAmount = 12,
+}
 
 // ── Storage key helpers ──────────────────────────────────────────────────────
 
@@ -106,7 +154,7 @@ pub struct Campaign {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DonationRecord {
     pub donor: Address,
-    pub amount: i128,   // net amount after fee
+    pub amount: i128, // net amount after fee
     pub fee: i128,
     pub asset: Symbol,
     pub timestamp: u64,
@@ -167,6 +215,16 @@ pub struct DashboardMetrics {
     pub total_transactions: u64,
 }
 
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Terminates contract execution with a typed [`CoreError`] code.
+///
+/// Mirrors the pattern used in the campaign contract for consistent error
+/// handling across the workspace.
+fn panic_with_error(env: &Env, error: CoreError) -> ! {
+    env.panic_with_error(error)
+}
+
 // ── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -177,7 +235,9 @@ impl OrbitChainContract {
     /// Initialize the contract with admin address
     pub fn initialize(env: Env, admin: Address) {
         admin.require_auth();
-        env.storage().instance().set(&symbol_short!("admin"), &admin);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("admin"), &admin);
         env.storage().instance().set(&symbol_short!("count"), &0u64);
     }
 
@@ -215,14 +275,16 @@ impl OrbitChainContract {
         };
 
         // Issue #99 – store each campaign keyed by its ID
-        env.storage().persistent().set(&campaign_key(count), &campaign);
-        env.storage().instance().set(&symbol_short!("count"), &count);
+        env.storage()
+            .persistent()
+            .set(&campaign_key(count), &campaign);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("count"), &count);
 
         // Emit CampaignCreated event
-        env.events().publish(
-            (Symbol::new(&env, "CampaignCreated"), creator),
-            count,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "CampaignCreated"), creator), count);
 
         count
     }
@@ -239,17 +301,23 @@ impl OrbitChainContract {
         donor.require_auth();
 
         // Issue #102 – validate asset is provided
-        assert!(asset != Symbol::new(&env, ""), "Asset must be specified");
-        assert!(amount > BASE_FEE, "Amount must exceed the base fee");
+        if asset == Symbol::new(&env, "") {
+            panic_with_error(&env, CoreError::AssetNotSpecified);
+        }
+        if amount <= BASE_FEE {
+            panic_with_error(&env, CoreError::InsufficientAmount);
+        }
 
         // Issue #99 – validate campaign existence
         let mut campaign: Campaign = env
             .storage()
             .persistent()
             .get(&campaign_key(campaign_id))
-            .expect("Campaign not found");
+            .unwrap_or_else(|| panic_with_error(&env, CoreError::CampaignNotFound));
 
-        assert!(campaign.active, "Campaign is not active");
+        if !campaign.active {
+            panic_with_error(&env, CoreError::CampaignNotActive);
+        }
 
         // Issue #103 – calculate and deduct fee
         let fee = BASE_FEE;
@@ -257,7 +325,9 @@ impl OrbitChainContract {
 
         // Update overall raised total
         campaign.raised += net;
-        env.storage().persistent().set(&campaign_key(campaign_id), &campaign);
+        env.storage()
+            .persistent()
+            .set(&campaign_key(campaign_id), &campaign);
 
         // Issue #102 – update per-asset raised total
         let prev_asset_raised: i128 = env
@@ -265,9 +335,10 @@ impl OrbitChainContract {
             .persistent()
             .get(&asset_raised_key(campaign_id, &asset))
             .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&asset_raised_key(campaign_id, &asset), &(prev_asset_raised + net));
+        env.storage().persistent().set(
+            &asset_raised_key(campaign_id, &asset),
+            &(prev_asset_raised + net),
+        );
 
         // Issue #104 – append to donation history
         let record = DonationRecord {
@@ -283,7 +354,9 @@ impl OrbitChainContract {
             .get(&history_key(campaign_id))
             .unwrap_or_else(|| vec![&env]);
         history.push_back(record);
-        env.storage().persistent().set(&history_key(campaign_id), &history);
+        env.storage()
+            .persistent()
+            .set(&history_key(campaign_id), &history);
 
         // Issue #100 – store donation metadata
         let metadata = DonationMetadata {
@@ -306,7 +379,9 @@ impl OrbitChainContract {
 
         if !donors.contains(&donor) {
             donors.push_back(donor.clone());
-            env.storage().persistent().set(&donors_key(campaign_id), &donors);
+            env.storage()
+                .persistent()
+                .set(&donors_key(campaign_id), &donors);
         }
 
         // Emit DonationReceived event
@@ -316,12 +391,10 @@ impl OrbitChainContract {
         );
 
         // Issue #142 – increment global transaction counter
-        let tx_count: u64 = env
-            .storage()
+        let tx_count: u64 = env.storage().instance().get(&total_tx_key()).unwrap_or(0);
+        env.storage()
             .instance()
-            .get(&total_tx_key())
-            .unwrap_or(0);
-        env.storage().instance().set(&total_tx_key(), &(tx_count + 1));
+            .set(&total_tx_key(), &(tx_count + 1));
 
         // Issue #145 – increment dedicated donation counter so it can be queried
         // independently of withdrawals.
@@ -427,20 +500,32 @@ impl OrbitChainContract {
 
     /// Issue #129 – request a withdrawal from a campaign.
     /// Creates a pending WithdrawalRequest that must be approved by admin (issue #131).
-    pub fn withdraw(env: Env, creator: Address, campaign_id: u64, recipient: Address, amount: i128) {
+    pub fn withdraw(
+        env: Env,
+        creator: Address,
+        campaign_id: u64,
+        recipient: Address,
+        amount: i128,
+    ) {
         creator.require_auth();
 
         // Issue #130 – validate recipient (non-zero amount, valid address type enforced by SDK)
-        assert!(amount > 0, "Withdrawal amount must be positive");
+        if amount <= 0 {
+            panic_with_error(&env, CoreError::InvalidWithdrawalAmount);
+        }
 
         let campaign: Campaign = env
             .storage()
             .persistent()
             .get(&campaign_key(campaign_id))
-            .expect("Campaign not found");
+            .unwrap_or_else(|| panic_with_error(&env, CoreError::CampaignNotFound));
 
-        assert!(campaign.creator == creator, "Only campaign creator can withdraw");
-        assert!(campaign.raised >= amount, "Insufficient raised funds");
+        if campaign.creator != creator {
+            panic_with_error(&env, CoreError::Unauthorized);
+        }
+        if campaign.raised < amount {
+            panic_with_error(&env, CoreError::InsufficientFunds);
+        }
 
         // Issue #138 – prevent double withdrawals: reject if a pending request already exists
         if let Some(existing) = env
@@ -448,10 +533,9 @@ impl OrbitChainContract {
             .persistent()
             .get::<_, WithdrawalRequest>(&pending_withdrawal_key(campaign_id))
         {
-            assert!(
-                existing.status == WithdrawalStatus::Submitted,
-                "A withdrawal request is already pending or approved for this campaign"
-            );
+            if existing.status != WithdrawalStatus::Submitted {
+                panic_with_error(&env, CoreError::WithdrawalAlreadyPending);
+            }
         }
 
         // Issue #131 – store pending withdrawal for admin approval
@@ -466,12 +550,10 @@ impl OrbitChainContract {
             .set(&pending_withdrawal_key(campaign_id), &request);
 
         // Issue #142 – increment global transaction counter
-        let tx_count: u64 = env
-            .storage()
+        let tx_count: u64 = env.storage().instance().get(&total_tx_key()).unwrap_or(0);
+        env.storage()
             .instance()
-            .get(&total_tx_key())
-            .unwrap_or(0);
-        env.storage().instance().set(&total_tx_key(), &(tx_count + 1));
+            .set(&total_tx_key(), &(tx_count + 1));
 
         // Issue #145 – increment dedicated withdrawal counter so it can be queried
         // independently of donations.
@@ -485,7 +567,11 @@ impl OrbitChainContract {
             .set(&total_withdrawals_key(), &(withdrawal_count + 1));
 
         env.events().publish(
-            (Symbol::new(&env, "WithdrawalRequested"), creator, campaign_id),
+            (
+                Symbol::new(&env, "WithdrawalRequested"),
+                creator,
+                campaign_id,
+            ),
             (recipient, amount),
         );
     }
@@ -498,26 +584,34 @@ impl OrbitChainContract {
             .storage()
             .instance()
             .get(&symbol_short!("admin"))
-            .expect("Contract not initialized");
-        assert!(admin == stored_admin, "Only admin can approve withdrawals");
+            .unwrap_or_else(|| panic_with_error(&env, CoreError::NotInitialized));
+        if admin != stored_admin {
+            panic_with_error(&env, CoreError::Unauthorized);
+        }
 
         let mut request: WithdrawalRequest = env
             .storage()
             .persistent()
             .get(&pending_withdrawal_key(campaign_id))
-            .expect("No pending withdrawal for this campaign");
+            .unwrap_or_else(|| panic_with_error(&env, CoreError::NoPendingWithdrawal));
 
-        assert!(request.status == WithdrawalStatus::Pending, "Withdrawal is not in pending state");
+        if request.status != WithdrawalStatus::Pending {
+            panic_with_error(&env, CoreError::WithdrawalNotPending);
+        }
 
         // Deduct from campaign raised balance
         let mut campaign: Campaign = env
             .storage()
             .persistent()
             .get(&campaign_key(campaign_id))
-            .expect("Campaign not found");
-        assert!(campaign.raised >= request.amount, "Insufficient funds");
+            .unwrap_or_else(|| panic_with_error(&env, CoreError::CampaignNotFound));
+        if campaign.raised < request.amount {
+            panic_with_error(&env, CoreError::InsufficientFunds);
+        }
         campaign.raised -= request.amount;
-        env.storage().persistent().set(&campaign_key(campaign_id), &campaign);
+        env.storage()
+            .persistent()
+            .set(&campaign_key(campaign_id), &campaign);
 
         request.status = WithdrawalStatus::Approved;
         env.storage()
@@ -542,19 +636,20 @@ impl OrbitChainContract {
             .storage()
             .instance()
             .get(&symbol_short!("admin"))
-            .expect("Contract not initialized");
-        assert!(admin == stored_admin, "Only admin can submit transactions");
+            .unwrap_or_else(|| panic_with_error(&env, CoreError::NotInitialized));
+        if admin != stored_admin {
+            panic_with_error(&env, CoreError::Unauthorized);
+        }
 
         let mut request: WithdrawalRequest = env
             .storage()
             .persistent()
             .get(&pending_withdrawal_key(campaign_id))
-            .expect("No withdrawal request for this campaign");
+            .unwrap_or_else(|| panic_with_error(&env, CoreError::NoPendingWithdrawal));
 
-        assert!(
-            request.status == WithdrawalStatus::Approved,
-            "Withdrawal must be approved before submission"
-        );
+        if request.status != WithdrawalStatus::Approved {
+            panic_with_error(&env, CoreError::WithdrawalNotApproved);
+        }
 
         // Issue #137 – update status to Submitted (confirmed on network)
         request.status = WithdrawalStatus::Submitted;
@@ -563,7 +658,11 @@ impl OrbitChainContract {
             .set(&pending_withdrawal_key(campaign_id), &request);
 
         env.events().publish(
-            (Symbol::new(&env, "TransactionSubmitted"), admin, campaign_id),
+            (
+                Symbol::new(&env, "TransactionSubmitted"),
+                admin,
+                campaign_id,
+            ),
             request.amount,
         );
 
@@ -579,10 +678,7 @@ impl OrbitChainContract {
 
     /// Issue #142 – expose total transaction count (donations + withdrawal requests)
     pub fn get_total_tx_count(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&total_tx_key())
-            .unwrap_or(0)
+        env.storage().instance().get(&total_tx_key()).unwrap_or(0)
     }
 
     // ── Analytics & reporting (issues #145, #146, #147, #148) ────────────────────────────
@@ -614,10 +710,7 @@ impl OrbitChainContract {
     /// Issue #147 – build a per-campaign report including funding progress, donor
     /// count and donation count. Returns `None` if the campaign does not exist.
     pub fn get_campaign_report(env: Env, campaign_id: u64) -> Option<CampaignReport> {
-        let campaign: Campaign = env
-            .storage()
-            .persistent()
-            .get(&campaign_key(campaign_id))?;
+        let campaign: Campaign = env.storage().persistent().get(&campaign_key(campaign_id))?;
 
         // Donor count (issue #101 storage)
         let donors: Vec<Address> = env
@@ -843,7 +936,7 @@ mod tests {
 
     /// Issue #138 – prevent double withdrawals
     #[test]
-    #[should_panic(expected = "A withdrawal request is already pending or approved")]
+    #[should_panic]
     fn test_prevent_double_withdrawal() {
         let env = Env::default();
         env.mock_all_auths();
@@ -897,7 +990,10 @@ mod tests {
     // ── Analytics & reporting tests (issues #145, #146, #147, #148) ────────────────────
 
     /// Helper: bootstrap a contract with admin + N campaigns and return the IDs.
-    fn setup_with_campaigns(env: &Env, n: u32) -> (OrbitChainContractClient<'_>, Address, Address, Vec<u64>) {
+    fn setup_with_campaigns(
+        env: &Env,
+        n: u32,
+    ) -> (OrbitChainContractClient<'_>, Address, Address, Vec<u64>) {
         env.mock_all_auths();
         let contract_id = env.register_contract(None, OrbitChainContract);
         let client = OrbitChainContractClient::new(env, &contract_id);
